@@ -11,7 +11,7 @@ import urllib.request
 import uuid
 
 CLIENT_ID = os.environ.get("VOLT_RPC_CLIENT_ID", "1565304926945550417")
-LARGE_IMAGE = "https://voltbz.net/Volt-OG.jpg"
+LARGE_IMAGE = "https://noic.fun/WCVBCGca.png"
 LARGE_TEXT = "Volt"
 SHOW_GAME_BUTTON = True
 WINDOW_TITLE = "Volt"
