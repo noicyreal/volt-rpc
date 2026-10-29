@@ -1,3 +1,4 @@
+import calendar
 import ctypes
 import ctypes.wintypes as wt
 import glob
@@ -14,6 +15,8 @@ CLIENT_ID = os.environ.get("VOLT_RPC_CLIENT_ID", "1565304926945550417")
 LARGE_IMAGE = "https://noic.fun/sChkZuMk.png"
 LARGE_TEXT = "Volt"
 SHOW_GAME_BUTTON = True
+VOLT_BUTTON = True
+VOLT_URL = "https://voltbz.net/"
 WINDOW_TITLE = "Volt"
 PROCESS_NAME = "tauri-app.exe"
 ROBLOX_PROCESS = "RobloxPlayerBeta.exe"
@@ -147,7 +150,13 @@ def _latest_layout():
     return json.loads(text)
 
 
-_layout_cache = {"sig": None, "title": None}
+LANGUAGES = {
+    "lua": "Lua", "luau": "Luau", "txt": "Text", "json": "JSON", "js": "JavaScript",
+    "ts": "TypeScript", "py": "Python", "md": "Markdown", "html": "HTML", "css": "CSS",
+}
+
+_layout_cache = {"sig": None, "info": None}
+_lines_cache = {}
 
 
 def volt_active_file():
@@ -156,13 +165,40 @@ def volt_active_file():
                     for p in glob.glob(os.path.join(VOLT_STORAGE, "*.log")))
         if sig != _layout_cache["sig"]:
             _layout_cache["sig"] = sig
-            _layout_cache["title"] = _active_title(_latest_layout())
+            _layout_cache["info"] = _active_tab(_latest_layout())
     except (OSError, ValueError):
-        _layout_cache["title"] = None
-    return _layout_cache["title"]
+        _layout_cache["info"] = None
+    info = _layout_cache["info"]
+    if info and info.get("source"):
+        info["lines"] = _line_count(info["source"])
+    return info
 
 
-def _active_title(layout):
+def _line_count(path):
+    try:
+        key = (os.path.getmtime(path), os.path.getsize(path))
+    except OSError:
+        return None
+    cached = _lines_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    lines = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+    _lines_cache[path] = (key, lines)
+    return lines
+
+
+def _language(tab):
+    ext = os.path.splitext(tab.get("path") or tab.get("title") or "")[1].lstrip(".").lower()
+    lang = ext if ext in LANGUAGES else (tab.get("language") or ext)
+    return LANGUAGES.get(lang, lang.capitalize() if lang else None)
+
+
+def _active_tab(layout):
     if not layout:
         return None
     groups = []
@@ -177,18 +213,33 @@ def _active_title(layout):
     group = next((g for g in groups if g.get("id") == layout.get("activeGroupId")), groups[0] if groups else None)
     if not group:
         return None
+    tabs = [t for g in groups for t in g.get("tabs", []) if t.get("kind") != "welcome"]
+    info = {"tabs": len(tabs)}
     tab = next((t for t in group["tabs"] if t.get("id") == group.get("activeTabId")), None)
     if not tab or tab.get("kind") == "welcome":
-        return None
-    return tab.get("title")
+        return info
+    info.update(
+        title=tab.get("title"),
+        language=_language(tab),
+        unsaved=bool(tab.get("isDirty")) and tab.get("kind") == "file",
+        source=tab.get("path") or tab.get("untitledTempPath"),
+    )
+    return info
 
 
 JOIN_RE = re.compile(r"! Joining game '[^']*' place (\d+)")
 UNIVERSE_RE = re.compile(r"universeid:(\d+)")
 LEAVE_RE = re.compile(r"Disconnected from server|leaveUGCGameInternal")
 
-_roblox = {"path": None, "offset": 0, "place": None, "universe": None}
+_roblox = {"path": None, "offset": 0, "place": None, "universe": None, "joined": None}
 _game_info = {}
+
+
+def _log_time(line):
+    try:
+        return calendar.timegm(time.strptime(line[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return time.time()
 
 
 def _newest_roblox_log():
@@ -198,13 +249,13 @@ def _newest_roblox_log():
 
 def roblox_game():
     if not pids_named(ROBLOX_PROCESS):
-        _roblox.update(path=None, offset=0, place=None, universe=None)
+        _roblox.update(path=None, offset=0, place=None, universe=None, joined=None)
         return None
     path = _newest_roblox_log()
     if not path:
         return None
     if path != _roblox["path"]:
-        _roblox.update(path=path, offset=0, place=None, universe=None)
+        _roblox.update(path=path, offset=0, place=None, universe=None, joined=None)
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         f.seek(_roblox["offset"])
         chunk = f.read()
@@ -213,16 +264,17 @@ def roblox_game():
         m = JOIN_RE.search(line)
         if m:
             _roblox["place"], _roblox["universe"] = m.group(1), None
+            _roblox["joined"] = _log_time(line)
             continue
         m = UNIVERSE_RE.search(line)
         if m and _roblox["place"]:
             _roblox["universe"] = m.group(1)
             continue
         if LEAVE_RE.search(line):
-            _roblox["place"] = _roblox["universe"] = None
+            _roblox["place"] = _roblox["universe"] = _roblox["joined"] = None
     if not _roblox["place"]:
         return None
-    return _roblox["place"], _roblox["universe"]
+    return _roblox["place"], _roblox["universe"], _roblox["joined"] or time.time()
 
 
 def _get_json(url):
@@ -231,21 +283,46 @@ def _get_json(url):
         return json.load(r)
 
 
+GAME_INFO_TTL = 300
+
+
 def game_info(universe_id):
-    if universe_id in _game_info:
-        return _game_info[universe_id]
-    name, icon = None, None
+    cached = _game_info.get(universe_id)
+    if cached and time.time() - cached[0] < GAME_INFO_TTL:
+        return cached[1]
+    info = dict(cached[1]) if cached else {}
     try:
-        name = _get_json(f"https://games.roblox.com/v1/games?universeIds={universe_id}")["data"][0]["name"]
-        icon = _get_json(
-            "https://thumbnails.roblox.com/v1/games/icons?universeIds="
-            f"{universe_id}&size=512x512&format=Png&isCircular=false&returnPolicy=PlaceHolder"
-        )["data"][0]["imageUrl"]
-    except (OSError, ValueError, KeyError, IndexError):
+        game = _get_json(f"https://games.roblox.com/v1/games?universeIds={universe_id}")["data"][0]
+        info.update(
+            name=game.get("name"),
+            creator=(game.get("creator") or {}).get("name"),
+            playing=game.get("playing"),
+        )
+        if "icon" not in info:
+            info["icon"] = _get_json(
+                "https://thumbnails.roblox.com/v1/games/icons?universeIds="
+                f"{universe_id}&size=512x512&format=Png&isCircular=false&returnPolicy=PlaceHolder"
+            )["data"][0]["imageUrl"]
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
         pass
-    if name:
-        _game_info[universe_id] = (name, icon)
-    return name, icon
+    if info.get("name"):
+        _game_info[universe_id] = (time.time(), info)
+    return info
+
+
+def _compact(n):
+    for size, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if n >= size:
+            return f"{n / size:.1f}".rstrip("0").rstrip(".") + suffix
+    return str(n)
+
+
+def _duration(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "just joined"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
 class DiscordIPC:
@@ -295,22 +372,49 @@ class DiscordIPC:
             self.pipe = None
 
 
-def build_activity(start, file_title, game):
-    activity = {
-        "details": f"Editing {file_title}"[:128] if file_title else "Using Volt",
-        "timestamps": {"start": start},
-    }
+def _join(*parts):
+    return " • ".join(p for p in parts if p)
+
+
+def build_activity(start, tab, game):
+    tab = tab or {}
+    title = tab.get("title")
+    lines = tab.get("lines")
+    tabs = tab.get("tabs") or 0
+    tab_text = f"{tabs} tab{'s' if tabs != 1 else ''} open" if tabs else None
+
+    if title:
+        details = _join(f"Editing {title}", f"{lines:,} line{'s' if lines != 1 else ''}" if lines else None)
+        if tab.get("unsaved"):
+            details += " (unsaved)"
+    else:
+        details = "On the home screen"
+    activity = {"details": details[:128], "timestamps": {"start": start}}
+
     assets = {}
     if LARGE_IMAGE:
-        assets.update(large_image=LARGE_IMAGE, large_text=LARGE_TEXT)
+        assets.update(large_image=LARGE_IMAGE, large_text=_join(LARGE_TEXT, tab.get("language"), tab_text)[:128])
+    buttons = []
     if game:
-        place, universe = game
-        name, icon = game_info(universe) if universe else (None, None)
-        activity["state"] = f"Playing {name}"[:128] if name else "In a Roblox game"
-        if icon:
-            assets.update(small_image=icon, small_text=name)
+        place, universe, joined = game
+        info = game_info(universe) if universe else {}
+        name = info.get("name")
+        activity["state"] = _join(f"Playing {name}" if name else "In a Roblox game", _duration(time.time() - joined))[:128]
+        if info.get("icon"):
+            playing = info.get("playing")
+            assets.update(small_image=info["icon"], small_text=_join(
+                name,
+                f"by {info['creator']}" if info.get("creator") else None,
+                f"{_compact(playing)} playing" if playing else None,
+            )[:128])
         if SHOW_GAME_BUTTON:
-            activity["buttons"] = [{"label": "View game", "url": f"https://www.roblox.com/games/{place}"}]
+            buttons.append({"label": "View game", "url": f"https://www.roblox.com/games/{place}"})
+    else:
+        activity["state"] = _join(tab.get("language"), tab_text) or "Idle"
+    if VOLT_BUTTON:
+        buttons.append({"label": "Get Volt", "url": VOLT_URL})
+    if buttons:
+        activity["buttons"] = buttons
     if assets:
         activity["assets"] = assets
     return activity
@@ -334,7 +438,9 @@ def main():
                         ipc.connect()
                     ipc.set_activity(activity)
                     current = activity
-                    print(f"Presence: {activity['details']} | {activity.get('state', '-')}")
+                    print(f"Presence: {activity['details']} | {activity.get('state', '-')} | "
+                          f"{activity.get('assets', {}).get('large_text', '-')} | "
+                          f"{activity.get('assets', {}).get('small_text', '-')}")
             elif current is not None:
                 ipc.set_activity(None)
                 current = start = None
