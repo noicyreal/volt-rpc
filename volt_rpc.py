@@ -449,13 +449,16 @@ def main():
             print(f"Discord connection issue: {e} - retrying...")
             ipc.close()
             current = None
+        except Exception as e:
+            print(f"Unexpected error: {e!r} - retrying...")
+            current = None
         sys.stdout.flush()
         time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
     if sys.stdout is None:
-        sys.stdout = sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "volt_rpc.log"), "a", buffering=1)
+        sys.stdout = sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "volt_rpc.log"), "a", buffering=1, encoding="utf-8", errors="replace")
     try:
         main()
     except KeyboardInterrupt:
