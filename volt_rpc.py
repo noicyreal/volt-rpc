@@ -21,6 +21,7 @@ WINDOW_TITLE = "Volt"
 PROCESS_NAME = "tauri-app.exe"
 ROBLOX_PROCESS = "RobloxPlayerBeta.exe"
 POLL_SECONDS = 5
+IDLE_AFTER = 300
 
 LOCALAPPDATA = os.environ["LOCALAPPDATA"]
 VOLT_STORAGE = os.path.join(LOCALAPPDATA, r"com.volt.editor\EBWebView\Default\Local Storage\leveldb")
@@ -62,11 +63,11 @@ def pids_named(name):
 EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
 
-def volt_running():
+def volt_window():
     pids = pids_named(PROCESS_NAME)
     if not pids:
-        return False
-    found = False
+        return None
+    found = None
 
     def cb(hwnd, _):
         nonlocal found
@@ -76,12 +77,35 @@ def volt_running():
             buf = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(hwnd, buf, 256)
             if buf.value == WINDOW_TITLE:
-                found = True
+                found = hwnd
                 return False
         return True
 
     user32.EnumWindows(EnumWindowsProc(cb), 0)
     return found
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+kernel32.GetTickCount.restype = wt.DWORD
+
+
+def idle_seconds():
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO))
+    if not user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0
+    return ((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
+
+
+def volt_status(hwnd):
+    idle = idle_seconds()
+    if idle >= IDLE_AFTER:
+        return "idle", idle
+    if user32.IsIconic(hwnd):
+        return "minimized", 0
+    return "active", 0
 
 
 LAYOUT_KEY = b"\x00\x01volt.workbenchLayout.v1"
@@ -376,12 +400,13 @@ def _join(*parts):
     return " • ".join(p for p in parts if p)
 
 
-def build_activity(start, tab, game):
+def build_activity(start, tab, game, status=("active", 0)):
     tab = tab or {}
     title = tab.get("title")
     lines = tab.get("lines")
     tabs = tab.get("tabs") or 0
     tab_text = f"{tabs} tab{'s' if tabs != 1 else ''} open" if tabs else None
+    mode, idle = status
 
     if title:
         details = _join(f"Editing {title}", f"{lines:,} line{'s' if lines != 1 else ''}" if lines else None)
@@ -389,11 +414,17 @@ def build_activity(start, tab, game):
             details += " (unsaved)"
     else:
         details = "On the home screen"
+    large_text = _join(LARGE_TEXT, tab.get("language"), tab_text)
+    if mode == "idle":
+        large_text = _join(LARGE_TEXT, details)
+        details = f"Idling • AFK {_duration(idle)}" if idle >= 60 else "Idling"
+    elif mode == "minimized":
+        details = f"Minimized • {details}"
     activity = {"details": details[:128], "timestamps": {"start": start}}
 
     assets = {}
     if LARGE_IMAGE:
-        assets.update(large_image=LARGE_IMAGE, large_text=_join(LARGE_TEXT, tab.get("language"), tab_text)[:128])
+        assets.update(large_image=LARGE_IMAGE, large_text=large_text[:128])
     buttons = []
     if game:
         place, universe, joined = game
@@ -430,9 +461,10 @@ def main():
     print("Volt RPC running. Ctrl+C to stop.")
     while True:
         try:
-            if volt_running():
+            hwnd = volt_window()
+            if hwnd:
                 start = start or int(time.time())
-                activity = build_activity(start, volt_active_file(), roblox_game())
+                activity = build_activity(start, volt_active_file(), roblox_game(), volt_status(hwnd))
                 if activity != current:
                     if ipc.pipe is None:
                         ipc.connect()
